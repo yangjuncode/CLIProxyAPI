@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -67,6 +68,10 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	// contents
 	contentsJSON := "[]"
 	hasContents := false
+
+	// tool_use_id → tool_name lookup, populated incrementally during the main loop.
+	// Claude's tool_result references tool_use by ID; Gemini requires functionResponse.name.
+	toolNameByID := make(map[string]string)
 
 	messagesResult := gjson.GetBytes(rawJSON, "messages")
 	if messagesResult.IsArray() {
@@ -170,6 +175,10 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						argsResult := contentResult.Get("input")
 						functionID := contentResult.Get("id").String()
 
+						if functionID != "" && functionName != "" {
+							toolNameByID[functionID] = functionName
+						}
+
 						// Handle both object and string input formats
 						var argsRaw string
 						if argsResult.IsObject() {
@@ -206,10 +215,19 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 					} else if contentTypeResult.Type == gjson.String && contentTypeResult.String() == "tool_result" {
 						toolCallID := contentResult.Get("tool_use_id").String()
 						if toolCallID != "" {
-							funcName := toolCallID
-							toolCallIDs := strings.Split(toolCallID, "-")
-							if len(toolCallIDs) > 1 {
-								funcName = strings.Join(toolCallIDs[0:len(toolCallIDs)-2], "-")
+							funcName, ok := toolNameByID[toolCallID]
+							if !ok {
+								// Fallback: derive a semantic name from the ID by stripping
+								// the last two dash-separated segments (e.g. "get_weather-call-123" → "get_weather").
+								// Only use the raw ID as a last resort when the heuristic produces an empty string.
+								parts := strings.Split(toolCallID, "-")
+								if len(parts) > 2 {
+									funcName = strings.Join(parts[:len(parts)-2], "-")
+								}
+								if funcName == "" {
+									funcName = toolCallID
+								}
+								log.Warnf("antigravity claude request: tool_result references unknown tool_use_id=%s, derived function name=%s", toolCallID, funcName)
 							}
 							functionResponseResult := contentResult.Get("content")
 
@@ -431,6 +449,33 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		out, _ = sjson.SetRaw(out, "request.tools", toolsJSON)
 	}
 
+	// tool_choice
+	toolChoiceResult := gjson.GetBytes(rawJSON, "tool_choice")
+	if toolChoiceResult.Exists() {
+		toolChoiceType := ""
+		toolChoiceName := ""
+		if toolChoiceResult.IsObject() {
+			toolChoiceType = toolChoiceResult.Get("type").String()
+			toolChoiceName = toolChoiceResult.Get("name").String()
+		} else if toolChoiceResult.Type == gjson.String {
+			toolChoiceType = toolChoiceResult.String()
+		}
+
+		switch toolChoiceType {
+		case "auto":
+			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "AUTO")
+		case "none":
+			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "NONE")
+		case "any":
+			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+		case "tool":
+			out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			if toolChoiceName != "" {
+				out, _ = sjson.Set(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{toolChoiceName})
+			}
+		}
+	}
+
 	// Map Anthropic thinking -> Gemini thinkingBudget/include_thoughts when type==enabled
 	if t := gjson.GetBytes(rawJSON, "thinking"); enableThoughtTranslate && t.Exists() && t.IsObject() {
 		switch t.Get("type").String() {
@@ -441,9 +486,19 @@ func ConvertClaudeRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 			}
 		case "adaptive", "auto":
-			// Keep adaptive/auto as a high level sentinel; ApplyThinking resolves it
-			// to model-specific max capability.
-			out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
+			// For adaptive thinking:
+			// - If output_config.effort is explicitly present, pass through as thinkingLevel.
+			// - Otherwise, treat it as "enabled with target-model maximum" and emit high.
+			// ApplyThinking handles clamping to target model's supported levels.
+			effort := ""
+			if v := gjson.GetBytes(rawJSON, "output_config.effort"); v.Exists() && v.Type == gjson.String {
+				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			}
+			if effort != "" {
+				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
+			} else {
+				out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.thinkingLevel", "high")
+			}
 			out, _ = sjson.Set(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 		}
 	}
