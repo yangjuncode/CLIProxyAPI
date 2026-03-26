@@ -1,0 +1,11 @@
+# 可重试错误特征配置
+# 键名对应 Provider 的标识符（如 codex, claude, gemini, openai-compatibility 等）
+# 值为一个列表，每个列表项可以是一个字符串（简单包含匹配）或一个字符串列表（需同时包含所有项）
+
+codex:
+  - [ "stream disconnected", "An error occurred", "help.openai.com" ] # 组合匹配示例
+
+# 通用模式，将被所有 Provider 检查
+global:
+  - "connection reset by peer"
+  - "EOF"

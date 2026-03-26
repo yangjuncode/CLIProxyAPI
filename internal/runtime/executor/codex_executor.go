@@ -166,6 +166,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 
+	if match, ok := e.findRetryableError(data); ok {
+		err = statusErr{code: 408, msg: fmt.Sprintf("stream error: retryable error detected: %s", match)}
+		return resp, err
+	}
+
 	lines := bytes.Split(data, []byte("\n"))
 	for _, line := range lines {
 		if !bytes.HasPrefix(line, dataTag) {
@@ -375,6 +380,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
+
+			if match, ok := e.findRetryableError(line); ok {
+				out <- cliproxyexecutor.StreamChunk{Err: statusErr{code: 408, msg: fmt.Sprintf("stream error: retryable error detected: %s", match)}}
+				return
+			}
 
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])

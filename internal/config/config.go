@@ -127,6 +127,11 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+
+	// RetryPatternsFile optionally points to a separate YAML file containing provider-specific retryable error patterns.
+	RetryPatternsFile string `yaml:"retry-patterns-file" json:"retry-patterns-file"`
+	// RetryPatterns stores the parsed error signature patterns from RetryPatternsFile.
+	RetryPatterns map[string][]any `yaml:"-" json:"-"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -673,6 +678,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
 	// 	}
 	// }
+
+	// Load separate retry patterns if configured or present.
+	cfg.LoadRetryPatterns(configFile)
 
 	// Return the populated configuration struct.
 	return &cfg, nil

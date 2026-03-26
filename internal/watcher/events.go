@@ -33,6 +33,13 @@ func (w *Watcher) start(ctx context.Context) error {
 	}
 	log.Debugf("watching config file: %s", w.configPath)
 
+	if retryPath := w.getRetryPatternsPath(); retryPath != "" {
+		if _, errStat := os.Stat(retryPath); errStat == nil {
+			_ = w.watcher.Add(retryPath)
+			log.Debugf("watching retry patterns file: %s", retryPath)
+		}
+	}
+
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
 		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
 		return errAddAuthDir
@@ -69,11 +76,15 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)
 	normalizedConfigPath := w.normalizeAuthPath(w.configPath)
+	normalizedRetryPath := w.normalizeAuthPath(w.getRetryPatternsPath())
 	normalizedAuthDir := w.normalizeAuthPath(w.authDir)
+
 	isConfigEvent := normalizedName == normalizedConfigPath && event.Op&configOps != 0
+	isRetryEvent := normalizedName == normalizedRetryPath && normalizedRetryPath != "" && event.Op&configOps != 0
+
 	authOps := fsnotify.Create | fsnotify.Write | fsnotify.Remove | fsnotify.Rename
 	isAuthJSON := strings.HasPrefix(normalizedName, normalizedAuthDir) && strings.HasSuffix(normalizedName, ".json") && event.Op&authOps != 0
-	if !isConfigEvent && !isAuthJSON {
+	if !isConfigEvent && !isRetryEvent && !isAuthJSON {
 		// Ignore unrelated files (e.g., cookie snapshots *.cookie) and other noise.
 		return
 	}
@@ -81,13 +92,12 @@ func (w *Watcher) handleEvent(event fsnotify.Event) {
 	now := time.Now()
 	log.Debugf("file system event detected: %s %s", event.Op.String(), event.Name)
 
-	// Handle config file changes
-	if isConfigEvent {
-		log.Debugf("config file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
+	// Handle config file or retry patterns changes
+	if isConfigEvent || isRetryEvent {
+		log.Debugf("config/retry-patterns file change details - operation: %s, timestamp: %s", event.Op.String(), now.Format("2006-01-02 15:04:05.000"))
 		w.scheduleConfigReload()
 		return
 	}
-
 	// Handle auth directory changes incrementally (.json only)
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		if w.shouldDebounceRemove(normalizedName, now) {

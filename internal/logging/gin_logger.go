@@ -45,11 +45,18 @@ func GinLogrusLogger() gin.HandlerFunc {
 
 		// Only generate request ID for AI API paths
 		var requestID string
+		var blw *bodyLogWriter
 		if isAIAPIPath(path) {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
 			ctx := WithRequestID(c.Request.Context(), requestID)
 			c.Request = c.Request.WithContext(ctx)
+
+			// Capture response body in debug mode for AI API requests
+			if log.GetLevel() >= log.DebugLevel {
+				blw = NewBodyLogWriter(c.Writer)
+				c.Writer = blw
+			}
 		}
 
 		c.Next()
@@ -80,6 +87,12 @@ func GinLogrusLogger() gin.HandlerFunc {
 		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
+		}
+
+		if blw != nil {
+			if body := blw.GetCapturedBody(); body != "" {
+				logLine = logLine + " | Body: " + body
+			}
 		}
 
 		entry := log.WithField("request_id", requestID)
