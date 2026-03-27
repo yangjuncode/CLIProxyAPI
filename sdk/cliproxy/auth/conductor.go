@@ -2915,12 +2915,20 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	if proxyInfo != "" {
 		suffix = " " + proxyInfo
 	}
+	baseURL := ""
+	if auth.Attributes != nil {
+		baseURL = auth.Attributes["base_url"]
+	}
+	urlSuffix := ""
+	if baseURL != "" {
+		urlSuffix = " (base_url: " + baseURL + ")"
+	}
 	switch accountType {
 	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+		entry.Debugf("Use API key %s for model %s%s%s", util.HideAPIKey(accountInfo), model, suffix, urlSuffix)
 	case "oauth":
 		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+		entry.Debugf("Use OAuth %s for model %s%s%s", ident, model, suffix, urlSuffix)
 	}
 }
 
