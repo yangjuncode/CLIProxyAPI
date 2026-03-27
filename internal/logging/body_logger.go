@@ -6,7 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-var maxResponseBodyLogSize = 512
+var maxResponseBodyLogSize = 1024
 
 // bodyLogWriter is a wrapper for gin.ResponseWriter that captures the beginning
 // of the response body for logging purposes.
