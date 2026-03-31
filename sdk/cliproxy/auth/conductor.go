@@ -1901,7 +1901,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if quotaCooldownDisabledForAuth(auth) {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(1 * time.Minute)
+								cooldownDuration := 1 * time.Minute
+								// 检查是否包含特定错误消息，如果是则应用10分钟冷却
+								if result.Error != nil && ShouldApplyExtendedCooldown(result.Error.Message) {
+									cooldownDuration = 10 * time.Minute
+								}
+								next := now.Add(cooldownDuration)
 								state.NextRetryAfter = next
 							}
 						default:
@@ -2256,13 +2261,30 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if quotaCooldownDisabledForAuth(auth) {
 			auth.NextRetryAfter = time.Time{}
 		} else {
-			auth.NextRetryAfter = now.Add(1 * time.Minute)
+			cooldownDuration := 1 * time.Minute
+			// 检查是否包含特定错误消息，如果是则应用10分钟冷却
+			if resultErr != nil && ShouldApplyExtendedCooldown(resultErr.Message) {
+				cooldownDuration = 10 * time.Minute
+				auth.StatusMessage = "extended cooldown for specific error"
+			}
+			auth.NextRetryAfter = now.Add(cooldownDuration)
 		}
 	default:
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+// ShouldApplyExtendedCooldown 检查错误消息是否需要应用扩展冷却时间
+func ShouldApplyExtendedCooldown(errorMessage string) bool {
+	if errorMessage == "" {
+		return false
+	}
+	lower := strings.ToLower(errorMessage)
+	return strings.Contains(lower, "无可用渠道") ||
+		strings.Contains(lower, "号池见底") ||
+		strings.Contains(lower, "distributor")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
