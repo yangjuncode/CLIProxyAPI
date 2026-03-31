@@ -2283,8 +2283,7 @@ func ShouldApplyExtendedCooldown(errorMessage string) bool {
 	}
 	lower := strings.ToLower(errorMessage)
 	return strings.Contains(lower, "无可用渠道") ||
-		strings.Contains(lower, "号池见底") ||
-		strings.Contains(lower, "distributor")
+		strings.Contains(lower, "号池见底")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
