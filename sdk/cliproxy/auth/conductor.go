@@ -93,6 +93,8 @@ type Result struct {
 	Model string
 	// Success marks whether the execution succeeded.
 	Success bool
+	// RequestSize carries the original inbound request size used for learned max input.
+	RequestSize int
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
@@ -449,11 +451,54 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 	return strings.TrimSpace(upstreamModel)
 }
 
-func filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+func requestSizeFromMetadata(meta map[string]any) int {
+	if len(meta) == 0 {
+		return 0
+	}
+	requestSize, ok := parseIntAny(meta[cliproxyexecutor.RequestSizeMetadataKey])
+	if !ok || requestSize <= 0 {
+		return 0
+	}
+	return requestSize
+}
+
+func hasActiveMaxInput(state *ModelState, now time.Time) bool {
+	if state == nil || state.MaxInput <= 0 {
+		return false
+	}
+	if state.MaxInputExpiresAt.IsZero() {
+		return false
+	}
+	return state.MaxInputExpiresAt.After(now)
+}
+
+func exceedsLearnedMaxInput(state *ModelState, requestSize int, now time.Time) bool {
+	if requestSize <= 0 || !hasActiveMaxInput(state, now) {
+		return false
+	}
+	return requestSize > state.MaxInput
+}
+
+func learnMaxInput(state *ModelState, requestSize int, now time.Time) {
+	if state == nil || requestSize <= 0 {
+		return
+	}
+	learned := requestSize - 10
+	if learned < 1 {
+		learned = 1
+	}
+	if state.MaxInput == 0 || !hasActiveMaxInput(state, now) || learned < state.MaxInput {
+		state.MaxInput = learned
+	}
+	state.MaxInputExpiresAt = now.Add(learnedMaxInputTTL)
+}
+
+func filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool, opts cliproxyexecutor.Options) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
 	now := time.Now()
+	requestSize := requestSizeFromMetadata(opts.Metadata)
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
 		stateModel := executionResultModel(routeModel, upstreamModel, pooled)
@@ -461,19 +506,56 @@ func filterExecutionModels(auth *Auth, routeModel string, candidates []string, p
 		if blocked {
 			continue
 		}
+		var state *ModelState
+		if auth != nil {
+			state = auth.ModelStates[stateModel]
+		}
+		if exceedsLearnedMaxInput(state, requestSize, now) {
+			continue
+		}
 		out = append(out, upstreamModel)
 	}
 	return out
 }
 
-func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
-	candidates := m.executionModelCandidates(auth, routeModel)
-	pooled := len(candidates) > 1
-	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+func learnedMaxInputExceededError(auth *Auth, routeModel string, candidates []string, pooled bool, opts cliproxyexecutor.Options) *Error {
+	if len(candidates) == 0 || auth == nil {
+		return nil
+	}
+	requestSize := requestSizeFromMetadata(opts.Metadata)
+	if requestSize <= 0 {
+		return nil
+	}
+	now := time.Now()
+	for _, upstreamModel := range candidates {
+		stateModel := executionResultModel(routeModel, upstreamModel, pooled)
+		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
+		if blocked {
+			continue
+		}
+		if exceedsLearnedMaxInput(auth.ModelStates[stateModel], requestSize, now) {
+			return &Error{
+				Code:       "request_too_large",
+				Message:    "request exceeds learned max input",
+				HTTPStatus: http.StatusRequestEntityTooLarge,
+			}
+		}
+	}
+	return nil
 }
 
-func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
-	models, _ := m.preparedExecutionModels(auth, routeModel)
+func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string, opts cliproxyexecutor.Options) ([]string, bool, *Error) {
+	candidates := m.executionModelCandidates(auth, routeModel)
+	pooled := len(candidates) > 1
+	models := filterExecutionModels(auth, routeModel, candidates, pooled, opts)
+	if len(models) == 0 {
+		return nil, pooled, learnedMaxInputExceededError(auth, routeModel, candidates, pooled, opts)
+	}
+	return models, pooled, nil
+}
+
+func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string, opts cliproxyexecutor.Options) []string {
+	models, _, _ := m.preparedExecutionModels(auth, routeModel, opts)
 	return models
 }
 
@@ -572,7 +654,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, resultModel string, requestSize int, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -585,7 +667,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -615,7 +697,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, RequestSize: requestSize})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -625,6 +707,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	requestSize := requestSizeFromMetadata(opts.Metadata)
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := executionResultModel(routeModel, execModel, pooled)
@@ -639,7 +722,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -660,7 +743,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -671,7 +754,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -682,7 +765,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
@@ -691,7 +774,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, RequestSize: requestSize, Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -706,7 +789,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, requestSize, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -1099,9 +1182,13 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		requestSize := requestSizeFromMetadata(opts.Metadata)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, filteredErr := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if filteredErr != nil {
+				lastErr = filteredErr
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1111,7 +1198,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestSize: requestSize}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1177,9 +1264,13 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		requestSize := requestSizeFromMetadata(opts.Metadata)
 
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, filteredErr := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if filteredErr != nil {
+				lastErr = filteredErr
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1189,7 +1280,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil, RequestSize: requestSize}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1263,8 +1354,11 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		models, pooled := m.preparedExecutionModels(auth, routeModel)
+		models, pooled, filteredErr := m.preparedExecutionModels(auth, routeModel, opts)
 		if len(models) == 0 {
+			if filteredErr != nil {
+				lastErr = filteredErr
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1736,7 +1830,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
 					state := ensureModelState(auth, result.Model)
-					state.Unavailable = true
 					state.Status = StatusError
 					state.UpdatedAt = now
 					if result.Error != nil {
@@ -1747,7 +1840,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
-					if isModelSupportResultError(result.Error) {
+					if statusCode == http.StatusRequestEntityTooLarge {
+						state.Unavailable = false
+						state.NextRetryAfter = time.Time{}
+						state.Quota = QuotaState{}
+						clearModelQuota = true
+						shouldResumeModel = true
+						learnMaxInput(state, result.RequestSize, now)
+					} else if isModelSupportResultError(result.Error) {
+						state.Unavailable = true
 						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "model_not_supported"
@@ -1755,21 +1856,25 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else {
 						switch statusCode {
 						case 401:
+							state.Unavailable = true
 							next := now.Add(30 * time.Minute)
 							state.NextRetryAfter = next
 							suspendReason = "unauthorized"
 							shouldSuspendModel = true
 						case 402, 403:
+							state.Unavailable = true
 							next := now.Add(30 * time.Minute)
 							state.NextRetryAfter = next
 							suspendReason = "payment_required"
 							shouldSuspendModel = true
 						case 404:
+							state.Unavailable = true
 							next := now.Add(12 * time.Hour)
 							state.NextRetryAfter = next
 							suspendReason = "not_found"
 							shouldSuspendModel = true
 						case 429:
+							state.Unavailable = true
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if result.RetryAfter != nil {
@@ -1792,6 +1897,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							shouldSuspendModel = true
 							setModelQuota = true
 						case 408, 500, 502, 503, 504:
+							state.Unavailable = true
 							if quotaCooldownDisabledForAuth(auth) {
 								state.NextRetryAfter = time.Time{}
 							} else {
@@ -1799,6 +1905,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								state.NextRetryAfter = next
 							}
 						default:
+							state.Unavailable = true
 							state.NextRetryAfter = time.Time{}
 						}
 					}

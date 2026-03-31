@@ -55,6 +55,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type originalRequestSizeContextKey struct{}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -89,6 +90,17 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithOriginalRequestSize returns a child context tagged with the client original request body size.
+func WithOriginalRequestSize(ctx context.Context, size int) context.Context {
+	if size <= 0 {
+		return ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, originalRequestSizeContextKey{}, size)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -211,6 +223,18 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func attachRequestSizeMetadata(ctx context.Context, meta map[string]any, rawJSON []byte) map[string]any {
+	if len(meta) == 0 {
+		meta = make(map[string]any, 1)
+	}
+	if size := originalRequestSizeFromContext(ctx); size > 0 {
+		meta[coreexecutor.RequestSizeMetadataKey] = size
+		return meta
+	}
+	meta[coreexecutor.RequestSizeMetadataKey] = len(rawJSON)
+	return meta
+}
+
 func pinnedAuthIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -250,6 +274,28 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func originalRequestSizeFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	raw := ctx.Value(originalRequestSizeContextKey{})
+	switch v := raw.(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int32:
+		if v > 0 {
+			return int(v)
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
+	}
+	return 0
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -473,7 +519,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -519,7 +565,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -569,7 +615,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {

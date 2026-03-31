@@ -15,6 +15,8 @@ import (
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 )
 
+const learnedMaxInputTTL = 8 * time.Hour
+
 // PostAuthHook defines a function that is called after an Auth record is created
 // but before it is persisted to storage. This allows for modification of the
 // Auth record (e.g., injecting metadata) based on external context.
@@ -121,6 +123,10 @@ type ModelState struct {
 	LastError *Error `json:"last_error,omitempty"`
 	// Quota retains quota information if this model hit rate limits.
 	Quota QuotaState `json:"quota"`
+	// MaxInput stores the learned maximum safe input size for this model.
+	MaxInput int `json:"max_input,omitempty"`
+	// MaxInputExpiresAt is when the learned MaxInput should stop affecting routing.
+	MaxInputExpiresAt time.Time `json:"max_input_expires_at,omitempty"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
 }

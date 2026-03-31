@@ -3,9 +3,11 @@ package auth
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -193,6 +195,58 @@ func newOpenAICompatPoolTestManager(t *testing.T, alias string, models []interna
 		reg.UnregisterClient(auth.ID)
 	})
 	return m
+}
+
+func getOpenAICompatPoolTestAuth(t *testing.T, m *Manager) *Auth {
+	t.Helper()
+	auth, ok := m.GetByID("pool-auth-" + t.Name())
+	if !ok || auth == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	return auth
+}
+
+func forceOpenAICompatAliasPoolFront(t *testing.T, m *Manager, auth *Auth, requestedModel string) {
+	t.Helper()
+	if m == nil {
+		t.Fatal("expected manager")
+	}
+	if auth == nil {
+		t.Fatal("expected auth")
+	}
+	key := openAICompatModelPoolKey(auth, requestedModel)
+	m.mu.Lock()
+	if m.modelPoolOffsets == nil {
+		m.modelPoolOffsets = make(map[string]int)
+	}
+	m.modelPoolOffsets[key] = 0
+	m.mu.Unlock()
+}
+
+func assertOpenAICompatLearnedMaxInputState(t *testing.T, m *Manager, model string, wantMaxInput int) *Auth {
+	t.Helper()
+	auth := getOpenAICompatPoolTestAuth(t, m)
+	state := auth.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %s", model)
+	}
+	if state.MaxInput != wantMaxInput {
+		t.Fatalf("state.MaxInput = %d, want %d", state.MaxInput, wantMaxInput)
+	}
+	if state.MaxInputExpiresAt.IsZero() {
+		t.Fatalf("state.MaxInputExpiresAt = zero, want set")
+	}
+	now := time.Now()
+	if !state.MaxInputExpiresAt.After(now) {
+		t.Fatalf("state.MaxInputExpiresAt = %v, want after %v", state.MaxInputExpiresAt, now)
+	}
+	if state.Unavailable {
+		t.Fatalf("state.Unavailable = true, want false")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("state.NextRetryAfter = %v, want zero", state.NextRetryAfter)
+	}
+	return auth
 }
 
 func readOpenAICompatStreamPayload(t *testing.T, streamResult *cliproxyexecutor.StreamResult) string {
@@ -540,6 +594,166 @@ func TestManagerExecute_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterReques
 	}
 }
 
+func TestManagerExecute_OpenAICompatAliasPoolSkipsLearnedOversizeModelOnLaterRequests(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:            "pool",
+		executeErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	firstResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+	if string(firstResp.Payload) != "glm-5" {
+		t.Fatalf("first payload = %q, want %q", string(firstResp.Payload), "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute: %v", err)
+	}
+	if string(secondResp.Payload) != "glm-5" {
+		t.Fatalf("second payload = %q, want %q", string(secondResp.Payload), "glm-5")
+	}
+
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute: %v", err)
+	}
+	if string(thirdResp.Payload) != "glm-5" {
+		t.Fatalf("third payload = %q, want %q", string(thirdResp.Payload), "glm-5")
+	}
+
+	got := executor.ExecuteModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecute_OpenAICompatAliasPoolAllowsLearnedModelForSmallerLaterRequest(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:            "pool",
+		executeErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	largeOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+	smallOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 100},
+	}
+
+	firstResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, largeOpts)
+	if err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+	if string(firstResp.Payload) != "glm-5" {
+		t.Fatalf("first payload = %q, want %q", string(firstResp.Payload), "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	delete(executor.executeErrors, "qwen3.5-plus")
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, smallOpts)
+	if err != nil {
+		t.Fatalf("second execute: %v", err)
+	}
+	if string(secondResp.Payload) != "qwen3.5-plus" {
+		t.Fatalf("second payload = %q, want %q", string(secondResp.Payload), "qwen3.5-plus")
+	}
+
+	got := executor.ExecuteModels()
+	want := []string{"qwen3.5-plus", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecute_OpenAICompatAliasPoolAllowsModelAgainAfterLearnedLimitExpires(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:            "pool",
+		executeErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	if _, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts); err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute before expiry: %v", err)
+	}
+	if string(secondResp.Payload) != "glm-5" {
+		t.Fatalf("second payload before expiry = %q, want %q", string(secondResp.Payload), "glm-5")
+	}
+	if got := executor.ExecuteModels(); !reflect.DeepEqual(got, []string{"qwen3.5-plus", "glm-5", "glm-5"}) {
+		t.Fatalf("execute calls before expiry = %v, want %v", got, []string{"qwen3.5-plus", "glm-5", "glm-5"})
+	}
+
+	state := auth.ModelStates["qwen3.5-plus"]
+	if state == nil {
+		t.Fatalf("expected model state for qwen3.5-plus")
+	}
+	state.MaxInputExpiresAt = time.Now().Add(-1 * time.Minute)
+	if _, err := m.Update(context.Background(), auth); err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+
+	delete(executor.executeErrors, "qwen3.5-plus")
+	auth = getOpenAICompatPoolTestAuth(t, m)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResp, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute: %v", err)
+	}
+	if string(thirdResp.Payload) != "qwen3.5-plus" {
+		t.Fatalf("third payload = %q, want %q", string(thirdResp.Payload), "qwen3.5-plus")
+	}
+
+	got := executor.ExecuteModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+}
+
 func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterRequests(t *testing.T) {
 	alias := "claude-opus-4.66"
 	modelSupportErr := &Error{
@@ -577,6 +791,194 @@ func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLater
 		if got[i] != want[i] {
 			t.Fatalf("stream call %d model = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolSkipsLearnedOversizeModelOnLaterRequests(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:                "pool",
+		streamFirstErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	firstResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("first execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, firstResult); got != "glm-5" {
+		t.Fatalf("first stream payload = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := firstResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("first stream header X-Model = %q, want %q", gotHeader, "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, secondResult); got != "glm-5" {
+		t.Fatalf("second stream payload = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := secondResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("second stream header X-Model = %q, want %q", gotHeader, "glm-5")
+	}
+
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, thirdResult); got != "glm-5" {
+		t.Fatalf("third stream payload = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := thirdResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("third stream header X-Model = %q, want %q", gotHeader, "glm-5")
+	}
+
+	got := executor.StreamModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolAllowsLearnedModelForSmallerLaterRequest(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:                "pool",
+		streamFirstErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	largeOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+	smallOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 100},
+	}
+
+	firstResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, largeOpts)
+	if err != nil {
+		t.Fatalf("first execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, firstResult); got != "glm-5" {
+		t.Fatalf("first stream payload = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := firstResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("first stream header X-Model = %q, want %q", gotHeader, "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	delete(executor.streamFirstErrors, "qwen3.5-plus")
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, smallOpts)
+	if err != nil {
+		t.Fatalf("second execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, secondResult); got != "qwen3.5-plus" {
+		t.Fatalf("second stream payload = %q, want %q", got, "qwen3.5-plus")
+	}
+	if gotHeader := secondResult.Headers.Get("X-Model"); gotHeader != "qwen3.5-plus" {
+		t.Fatalf("second stream header X-Model = %q, want %q", gotHeader, "qwen3.5-plus")
+	}
+
+	got := executor.StreamModels()
+	want := []string{"qwen3.5-plus", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecuteStream_OpenAICompatAliasPoolAllowsModelAgainAfterLearnedLimitExpires(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:                "pool",
+		streamFirstErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	firstResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("first execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, firstResult); got != "glm-5" {
+		t.Fatalf("first stream payload = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := firstResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("first stream header X-Model = %q, want %q", gotHeader, "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute stream before expiry: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, secondResult); got != "glm-5" {
+		t.Fatalf("second stream payload before expiry = %q, want %q", got, "glm-5")
+	}
+	if gotHeader := secondResult.Headers.Get("X-Model"); gotHeader != "glm-5" {
+		t.Fatalf("second stream header X-Model before expiry = %q, want %q", gotHeader, "glm-5")
+	}
+	if got := executor.StreamModels(); !reflect.DeepEqual(got, []string{"qwen3.5-plus", "glm-5", "glm-5"}) {
+		t.Fatalf("stream calls before expiry = %v, want %v", got, []string{"qwen3.5-plus", "glm-5", "glm-5"})
+	}
+
+	state := auth.ModelStates["qwen3.5-plus"]
+	if state == nil {
+		t.Fatalf("expected model state for qwen3.5-plus")
+	}
+	state.MaxInputExpiresAt = time.Now().Add(-1 * time.Minute)
+	if _, err := m.Update(context.Background(), auth); err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+
+	delete(executor.streamFirstErrors, "qwen3.5-plus")
+	auth = getOpenAICompatPoolTestAuth(t, m)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResult, err := m.ExecuteStream(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute stream: %v", err)
+	}
+	if got := readOpenAICompatStreamPayload(t, thirdResult); got != "qwen3.5-plus" {
+		t.Fatalf("third stream payload = %q, want %q", got, "qwen3.5-plus")
+	}
+	if gotHeader := thirdResult.Headers.Get("X-Model"); gotHeader != "qwen3.5-plus" {
+		t.Fatalf("third stream header X-Model = %q, want %q", gotHeader, "qwen3.5-plus")
+	}
+
+	got := executor.StreamModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
 	}
 }
 
@@ -641,6 +1043,170 @@ func TestManagerExecuteCount_OpenAICompatAliasPoolSkipsSuspendedUpstreamOnLaterR
 		if got[i] != want[i] {
 			t.Fatalf("count call %d model = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestManagerExecuteCount_OpenAICompatAliasPoolSkipsLearnedOversizeModelOnLaterRequests(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:          "pool",
+		countErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	firstResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("first execute count: %v", err)
+	}
+	if string(firstResp.Payload) != "glm-5" {
+		t.Fatalf("first payload = %q, want %q", string(firstResp.Payload), "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute count: %v", err)
+	}
+	if string(secondResp.Payload) != "glm-5" {
+		t.Fatalf("second payload = %q, want %q", string(secondResp.Payload), "glm-5")
+	}
+
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute count: %v", err)
+	}
+	if string(thirdResp.Payload) != "glm-5" {
+		t.Fatalf("third payload = %q, want %q", string(thirdResp.Payload), "glm-5")
+	}
+
+	got := executor.CountModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "glm-5"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("count calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecuteCount_OpenAICompatAliasPoolAllowsLearnedModelForSmallerLaterRequest(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:          "pool",
+		countErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	largeOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+	smallOpts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 100},
+	}
+
+	firstResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, largeOpts)
+	if err != nil {
+		t.Fatalf("first execute count: %v", err)
+	}
+	if string(firstResp.Payload) != "glm-5" {
+		t.Fatalf("first payload = %q, want %q", string(firstResp.Payload), "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	delete(executor.countErrors, "qwen3.5-plus")
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, smallOpts)
+	if err != nil {
+		t.Fatalf("second execute count: %v", err)
+	}
+	if string(secondResp.Payload) != "qwen3.5-plus" {
+		t.Fatalf("second payload = %q, want %q", string(secondResp.Payload), "qwen3.5-plus")
+	}
+
+	got := executor.CountModels()
+	want := []string{"qwen3.5-plus", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("count calls = %v, want %v", got, want)
+	}
+}
+
+func TestManagerExecuteCount_OpenAICompatAliasPoolAllowsModelAgainAfterLearnedLimitExpires(t *testing.T) {
+	alias := "claude-opus-4.66"
+	tooLarge := &Error{HTTPStatus: http.StatusRequestEntityTooLarge, Message: "too large"}
+	executor := &openAICompatPoolExecutor{
+		id:          "pool",
+		countErrors: map[string]error{"qwen3.5-plus": tooLarge},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+		{Name: "glm-5", Alias: alias},
+	}, executor)
+
+	opts := cliproxyexecutor.Options{
+		Metadata: map[string]any{cliproxyexecutor.RequestSizeMetadataKey: 120},
+	}
+
+	firstResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("first execute count: %v", err)
+	}
+	if string(firstResp.Payload) != "glm-5" {
+		t.Fatalf("first payload = %q, want %q", string(firstResp.Payload), "glm-5")
+	}
+
+	auth := assertOpenAICompatLearnedMaxInputState(t, m, "qwen3.5-plus", 110)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	secondResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("second execute count before expiry: %v", err)
+	}
+	if string(secondResp.Payload) != "glm-5" {
+		t.Fatalf("second payload before expiry = %q, want %q", string(secondResp.Payload), "glm-5")
+	}
+	if got := executor.CountModels(); !reflect.DeepEqual(got, []string{"qwen3.5-plus", "glm-5", "glm-5"}) {
+		t.Fatalf("count calls before expiry = %v, want %v", got, []string{"qwen3.5-plus", "glm-5", "glm-5"})
+	}
+
+	state := auth.ModelStates["qwen3.5-plus"]
+	if state == nil {
+		t.Fatalf("expected model state for qwen3.5-plus")
+	}
+	state.MaxInputExpiresAt = time.Now().Add(-1 * time.Minute)
+	if _, err := m.Update(context.Background(), auth); err != nil {
+		t.Fatalf("update auth: %v", err)
+	}
+
+	delete(executor.countErrors, "qwen3.5-plus")
+	auth = getOpenAICompatPoolTestAuth(t, m)
+	forceOpenAICompatAliasPoolFront(t, m, auth, alias)
+
+	thirdResp, err := m.ExecuteCount(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err != nil {
+		t.Fatalf("third execute count: %v", err)
+	}
+	if string(thirdResp.Payload) != "qwen3.5-plus" {
+		t.Fatalf("third payload = %q, want %q", string(thirdResp.Payload), "qwen3.5-plus")
+	}
+
+	got := executor.CountModels()
+	want := []string{"qwen3.5-plus", "glm-5", "glm-5", "qwen3.5-plus"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("count calls = %v, want %v", got, want)
 	}
 }
 
