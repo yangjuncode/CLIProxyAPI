@@ -2318,6 +2318,7 @@ func ShouldApplyExtendedCooldown(errorMessage string) bool {
 	lower := strings.ToLower(errorMessage)
 	return strings.Contains(lower, "无可用渠道") || strings.Contains(lower, "no available channel") ||
 		strings.Contains(lower, "号池见底") ||
+		strings.Contains(lower, "倒闭") ||
 		strings.Contains(lower, "额度不足")
 }
 
