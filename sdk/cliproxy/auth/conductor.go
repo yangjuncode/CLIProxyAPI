@@ -1863,9 +1863,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							shouldSuspendModel = true
 						case 402, 403:
 							state.Unavailable = true
-							next := now.Add(30 * time.Minute)
+							cooldownDuration := 30 * time.Minute
+							// 检查是否包含"额度不足"错误消息，如果是则应用8小时冷却
+							if result.Error != nil && ShouldApplyExtendedCooldown(result.Error.Message) {
+								cooldownDuration = 8 * time.Hour
+								suspendReason = "insufficient balance - extended cooldown"
+							} else {
+								suspendReason = "payment_required"
+							}
+							next := now.Add(cooldownDuration)
 							state.NextRetryAfter = next
-							suspendReason = "payment_required"
 							shouldSuspendModel = true
 						case 404:
 							state.Unavailable = true
@@ -2236,7 +2243,13 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
-		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		cooldownDuration := 30 * time.Minute
+		// 检查是否包含"额度不足"错误消息，如果是则应用8小时冷却
+		if resultErr != nil && ShouldApplyExtendedCooldown(resultErr.Message) {
+			cooldownDuration = 8 * time.Hour
+			auth.StatusMessage = "insufficient balance - extended cooldown"
+		}
+		auth.NextRetryAfter = now.Add(cooldownDuration)
 	case 404:
 		auth.StatusMessage = "not_found"
 		auth.NextRetryAfter = now.Add(12 * time.Hour)
@@ -2282,8 +2295,9 @@ func ShouldApplyExtendedCooldown(errorMessage string) bool {
 		return false
 	}
 	lower := strings.ToLower(errorMessage)
-	return strings.Contains(lower, "无可用渠道") ||
-		strings.Contains(lower, "号池见底")
+	return strings.Contains(lower, "无可用渠道") || strings.Contains(lower, "no available channel") ||
+		strings.Contains(lower, "号池见底") ||
+		strings.Contains(lower, "额度不足")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
