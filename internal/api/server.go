@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	errorhistory "github.com/router-for-me/CLIProxyAPI/v6/internal/errors"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -161,6 +162,12 @@ type Server struct {
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
 
+	// error history management
+	errorManager     *errorhistory.ErrorHistoryManager
+	errorCollector   *errorhistory.ErrorCollector
+	errorHandler     *managementHandlers.ErrorHandler
+	errorCleanupStop chan struct{}
+
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
@@ -273,6 +280,18 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	s.localPassword = optionState.localPassword
 
+	// Initialize error history management
+	s.errorManager = errorhistory.NewErrorHistoryManager(10) // 10MB limit
+	s.errorCollector = errorhistory.NewErrorCollector(s.errorManager)
+	s.errorHandler = managementHandlers.NewErrorHandler(s.errorManager)
+	s.errorCleanupStop = make(chan struct{})
+
+	// Start error cleanup routine
+	go s.errorManager.StartCleanupRoutine(s.errorCleanupStop)
+
+	// Add error collection middleware
+	engine.Use(middleware.ErrorCollectionMiddleware(s.errorCollector))
+
 	// Setup routes
 	s.setupRoutes()
 
@@ -358,6 +377,11 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
+
+	// Public errors endpoint (text format) - uses management authentication
+	if s.errorHandler != nil {
+		s.engine.GET("/errors", s.managementAvailabilityMiddleware(), s.mgmt.Middleware(), s.errorHandler.GetErrors)
+	}
 	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
 
 	// OAuth callback endpoints (reuse main server port)
@@ -640,6 +664,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+
+		// Error history routes
+		if s.errorHandler != nil {
+			mgmt.GET("/errors", s.errorHandler.GetErrors)
+			mgmt.GET("/errors.json", s.errorHandler.GetErrorsJSON)
+			mgmt.GET("/errors/stats", s.errorHandler.GetStats)
+			mgmt.DELETE("/errors", s.errorHandler.ClearErrors)
+		}
 	}
 }
 
@@ -822,6 +854,12 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
+	// Stop error cleanup routine
+	if s.errorCleanupStop != nil {
+		close(s.errorCleanupStop)
+		s.errorCleanupStop = nil
+	}
 
 	if s.keepAliveEnabled {
 		select {

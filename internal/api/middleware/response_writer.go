@@ -250,6 +250,14 @@ func (w *ResponseWriterWrapper) processStreamingChunks(done chan struct{}) {
 	}
 }
 
+// GetResponseBody 返回捕获的响应体数据
+func (w *ResponseWriterWrapper) GetResponseBody() []byte {
+	if w.body != nil {
+		return w.body.Bytes()
+	}
+	return nil
+}
+
 // Finalize completes the logging process for the request and response.
 // For streaming responses, it closes the chunk channel and the stream writer.
 // For non-streaming responses, it logs the complete request and response details,

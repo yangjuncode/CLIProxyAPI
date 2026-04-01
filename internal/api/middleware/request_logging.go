@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/errors"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
@@ -56,6 +57,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			wrapper.logOnErrorOnly = true
 		}
 		c.Writer = wrapper
+		c.Set("response_writer", wrapper)
 
 		// Process the request
 		c.Next()
@@ -66,6 +68,18 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			// In a real implementation, you might want to use a proper logger here
 		}
 	}
+}
+
+// ErrorCollectionMiddleware creates a Gin middleware that collects error information
+// and stores it in the error history manager.
+func ErrorCollectionMiddleware(errorCollector *errors.ErrorCollector) gin.HandlerFunc {
+	if errorCollector == nil {
+		return func(c *gin.Context) {
+			c.Next()
+		}
+	}
+
+	return errorCollector.Middleware()
 }
 
 func shouldSkipMethodForRequestLogging(req *http.Request) bool {

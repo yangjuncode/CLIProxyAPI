@@ -519,6 +519,10 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil {
+		c.Set("API_PROVIDER", providers)
+		c.Set("API_MODEL", normalizedModel)
+	}
 	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -564,6 +568,10 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil {
+		c.Set("API_PROVIDER", providers)
+		c.Set("API_MODEL", normalizedModel)
 	}
 	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
@@ -614,6 +622,10 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		errChan <- errMsg
 		close(errChan)
 		return nil, nil, errChan
+	}
+	if c, ok := ctx.Value("gin").(*gin.Context); ok && c != nil {
+		c.Set("API_PROVIDER", providers)
+		c.Set("API_MODEL", normalizedModel)
 	}
 	reqMeta := attachRequestSizeMetadata(ctx, requestExecutionMetadata(ctx), rawJSON)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel

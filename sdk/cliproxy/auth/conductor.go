@@ -2319,7 +2319,8 @@ func ShouldApplyExtendedCooldown(errorMessage string) bool {
 	return strings.Contains(lower, "无可用渠道") || strings.Contains(lower, "no available channel") ||
 		strings.Contains(lower, "号池见底") ||
 		strings.Contains(lower, "倒闭") ||
-		strings.Contains(lower, "额度不足")
+		strings.Contains(lower, "额度不足") ||
+		strings.Contains(lower, "service temporarily unavailable")
 }
 
 // isContextLimitError 检查错误消息是否为上下文超出限制错误

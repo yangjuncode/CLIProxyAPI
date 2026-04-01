@@ -1,0 +1,12 @@
+host: "127.0.0.1"
+port: 8345
+auth-dir: "./.test-auth"
+api-keys:
+  - "test-api-key"
+debug: true
+commercial-mode: false
+remote-management:
+  allow-remote: true
+  secret-key: "$2a$10$ytDhH.3cjEbMIUJVYcOZl.g7uT5TFf6CVOxdL1dMbYBnXaZ3dYcWO"
+routing:
+  strategy: "round-robin"
