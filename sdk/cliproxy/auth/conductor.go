@@ -1847,6 +1847,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						clearModelQuota = true
 						shouldResumeModel = true
 						learnMaxInput(state, result.RequestSize, now)
+					} else if result.Error != nil && isContextLimitError(result.Error.Message) {
+						// 检测到"上下文超出"错误时也调用learnMaxInput
+						state.Unavailable = false
+						state.NextRetryAfter = time.Time{}
+						state.Quota = QuotaState{}
+						clearModelQuota = true
+						shouldResumeModel = true
+						learnMaxInput(state, result.RequestSize, now)
 					} else if isModelSupportResultError(result.Error) {
 						state.Unavailable = true
 						next := now.Add(12 * time.Hour)
@@ -1927,7 +1935,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					updateAggregatedAvailability(auth, now)
 				}
 			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				applyAuthFailureState(auth, result.Error, result.RetryAfter, result.RequestSize, now)
 			}
 		}
 
@@ -2220,7 +2228,7 @@ func isRequestInvalidError(err error) bool {
 	}
 }
 
-func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
+func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, requestSize int, now time.Time) {
 	if auth == nil {
 		return
 	}
@@ -2238,6 +2246,16 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
+	case http.StatusRequestEntityTooLarge:
+		// 413错误：调用learnMaxInput更新模型的最大输入限制
+		if auth.ModelStates != nil {
+			for _, modelState := range auth.ModelStates {
+				if modelState != nil {
+					learnMaxInput(modelState, requestSize, now)
+				}
+			}
+		}
+		auth.StatusMessage = "request too large - learned max input"
 	case 401:
 		auth.StatusMessage = "unauthorized"
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
@@ -2283,7 +2301,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(cooldownDuration)
 		}
 	default:
-		if auth.StatusMessage == "" {
+		// 检查是否为上下文超出错误，如果是则设置相应的状态消息
+		if resultErr != nil && isContextLimitError(resultErr.Message) {
+			auth.StatusMessage = "context limit exceeded"
+		} else if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
 	}
@@ -2298,6 +2319,15 @@ func ShouldApplyExtendedCooldown(errorMessage string) bool {
 	return strings.Contains(lower, "无可用渠道") || strings.Contains(lower, "no available channel") ||
 		strings.Contains(lower, "号池见底") ||
 		strings.Contains(lower, "额度不足")
+}
+
+// isContextLimitError 检查错误消息是否为上下文超出限制错误
+func isContextLimitError(errorMessage string) bool {
+	if errorMessage == "" {
+		return false
+	}
+	lower := strings.ToLower(errorMessage)
+	return strings.Contains(lower, "上下文超出")
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
